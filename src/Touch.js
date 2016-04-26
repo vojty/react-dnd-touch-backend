@@ -41,7 +41,8 @@ const eventNames = {
     mouse: {
         start: 'mousedown',
         move: 'mousemove',
-        end: 'mouseup'
+        end: 'mouseup',
+        click: 'click'
     },
     touch: {
         start: 'touchstart',
@@ -49,6 +50,23 @@ const eventNames = {
         end: 'touchend'
     }
 };
+
+function getNodesAtOffset(nodes, clientOffset) {
+    return Object.keys(nodes)
+        .filter((nodeId) => {
+            const boundingRect = nodes[nodeId].getBoundingClientRect();
+            return clientOffset.x >= boundingRect.left &&
+                clientOffset.x <= boundingRect.right &&
+                clientOffset.y >= boundingRect.top &&
+                clientOffset.y <= boundingRect.bottom;
+        });
+}
+
+function getDistance(p1, p2) {
+    const a = p1.x - p2.x;
+    const b = p1.y - p2.y;
+    return Math.sqrt(a * a + b * b);
+}
 
 export class TouchBackend {
     constructor (manager, options = {}) {
@@ -68,10 +86,11 @@ export class TouchBackend {
         this.sourceNodeOptions = {};
         this.sourcePreviewNodes = {};
         this.sourcePreviewNodeOptions = {};
+        this.moveStartSourceIds = {};
         this.targetNodes = {};
         this.targetNodeOptions = {};
         this.listenerTypes = [];
-        this._mouseClientOffset = {};
+        this._mouseClientOffset = null;
 
         if (options.enableMouseEvents) {
             this.listenerTypes.push('mouse');
@@ -89,6 +108,10 @@ export class TouchBackend {
         this.handleTopMoveEndCapture = this.handleTopMoveEndCapture.bind(this);
     }
 
+    startHandler() {
+        return this.delay ? this.handleTopMoveStartDelay : this.handleTopMoveStart;
+    }
+
     setup () {
         if (typeof window === 'undefined') {
             return;
@@ -97,11 +120,7 @@ export class TouchBackend {
         invariant(!this.constructor.isSetUp, 'Cannot have two Touch backends at the same time.');
         this.constructor.isSetUp = true;
 
-        var startHandler = this.delay
-            ? this.handleTopMoveStartDelay
-            : this.handleTopMoveStart;
-
-        this.addEventListener(window, 'start', startHandler);
+        this.addEventListener(window, 'start', this.startHandler());
         this.addEventListener(window, 'start', this.handleTopMoveStartCapture, true);
         this.addEventListener(window, 'move',  this.handleTopMoveCapture, true);
         this.addEventListener(window, 'end',   this.handleTopMoveEndCapture, true);
@@ -113,37 +132,45 @@ export class TouchBackend {
         }
 
         this.constructor.isSetUp = false;
-        this._mouseClientOffset = {};
+        this._mouseClientOffset = null;
 
+        this.removeEventListener(window, 'start', this.startHandler());
         this.removeEventListener(window, 'start', this.handleTopMoveStartCapture, true);
-        this.removeEventListener(window, 'start', this.handleTopMoveStart);
         this.removeEventListener(window, 'move',  this.handleTopMoveCapture, true);
         this.removeEventListener(window, 'end',   this.handleTopMoveEndCapture, true);
-
-        this.uninstallSourceNodeRemovalObserver();
     }
 
     addEventListener (subject, event, handler, capture) {
         this.listenerTypes.forEach(function (listenerType) {
-            subject.addEventListener(eventNames[listenerType][event], handler, capture);
+            let eventName = eventNames[listenerType][event];
+            if (eventName) {
+                subject.addEventListener(eventName, handler, capture);
+            }
         });
     }
 
     removeEventListener (subject, event, handler, capture) {
         this.listenerTypes.forEach(function (listenerType) {
-            subject.removeEventListener(eventNames[listenerType][event], handler, capture);
+            let eventName = eventNames[listenerType][event];
+            if (eventName) {
+                subject.removeEventListener(eventName, handler, capture);
+            }
         });
     }
 
     connectDragSource (sourceId, node, options) {
         const handleMoveStart = this.handleMoveStart.bind(this, sourceId);
+        const handleCancelClick = this.handleCancelClick.bind(this, sourceId);
+
         this.sourceNodes[sourceId] = node;
 
         this.addEventListener(node, 'start', handleMoveStart);
+        this.addEventListener(node, 'click', handleCancelClick, true);
 
         return () => {
             delete this.sourceNodes[sourceId];
             this.removeEventListener(node, 'start', handleMoveStart);
+            this.removeEventListener(node, 'click', handleCancelClick, true);
         };
     }
 
@@ -170,22 +197,29 @@ export class TouchBackend {
     }
 
     handleTopMoveStartCapture (e) {
-        this.moveStartSourceIds = [];
+        this.moveStartSourceIds = {};
     }
 
     handleMoveStart (sourceId) {
-        this.moveStartSourceIds.unshift(sourceId);
+        this.moveStartSourceIds[sourceId] = true;
+    }
+
+    handleCancelClick (sourceId, e) {
+        if (this.moveStartSourceIds[sourceId]) {
+            e.stopPropagation();
+        }
     }
 
     handleTopMoveStart (e) {
-        // Don't prematurely preventDefault() here since it might:
-        // 1. Mess up scrolling
-        // 2. Mess up long tap (which brings up context menu)
-        // 3. If there's an anchor link as a child, tap won't be triggered on link
-
         const clientOffset = getEventClientOffset(e);
-        if (clientOffset) {
+        if (clientOffset && getNodesAtOffset(this.sourceNodes, clientOffset).length > 0) {
             this._mouseClientOffset = clientOffset;
+
+            // note: calling preventDefault here, seems to be the only way to defeat text selection in Safari
+            // to handle other browsers, we could just call window.getSelection().removeAllRanges();
+            if (e.target.tagName !== 'SELECT' && e.target.tagName !== 'INPUT') {
+                e.preventDefault();
+            }
         }
     }
 
@@ -196,105 +230,54 @@ export class TouchBackend {
     handleTopMoveCapture (e) {
         clearTimeout(this.timeout);
 
-        const { moveStartSourceIds } = this;
         const clientOffset = getEventClientOffset(e);
-
         if (!clientOffset) {
             return;
         }
 
-
         // If we're not dragging and we've moved a little, that counts as a drag start
-        if (
-            !this.monitor.isDragging() &&
-            this._mouseClientOffset.hasOwnProperty('x') &&
-            moveStartSourceIds &&
-            (
-                this._mouseClientOffset.x !== clientOffset.x ||
-                this._mouseClientOffset.y !== clientOffset.y
-            )
-        ) {
-            this.moveStartSourceIds = null;
-            this.actions.beginDrag(moveStartSourceIds, {
-                clientOffset: this._mouseClientOffset,
-                getSourceClientOffset: this.getSourceClientOffset,
-                publishSource: false
-            });
-        }
-
         if (!this.monitor.isDragging()) {
+            if (
+                this._mouseClientOffset &&
+                getDistance(this._mouseClientOffset, clientOffset) > 2
+            ) {
+                const sourceIdsArray = Object.keys(this.moveStartSourceIds);
+                if (sourceIdsArray.length > 0) {
+                    e.preventDefault();
+
+                    this.actions.beginDrag(sourceIdsArray, {
+                        clientOffset: this._mouseClientOffset,
+                        getSourceClientOffset: this.getSourceClientOffset,
+                        publishSource: false
+                    });
+
+                    this._mouseClientOffset = null;
+                }
+            }
+
             return;
         }
 
-        const sourceNode = this.sourceNodes[this.monitor.getSourceId()];
-        this.installSourceNodeRemovalObserver(sourceNode);
         this.actions.publishDragSource();
 
         e.preventDefault();
 
-        const matchingTargetIds = Object.keys(this.targetNodes)
-            .filter((targetId) => {
-                const boundingRect = this.targetNodes[targetId].getBoundingClientRect();
-                return clientOffset.x >= boundingRect.left &&
-                clientOffset.x <= boundingRect.right &&
-                clientOffset.y >= boundingRect.top &&
-                clientOffset.y <= boundingRect.bottom;
-            });
-
-        this.actions.hover(matchingTargetIds, {
-            clientOffset: clientOffset
-        });
+        const matchingTargetIds = getNodesAtOffset(this.targetNodes, clientOffset);
+        this.actions.hover(matchingTargetIds, { clientOffset });
     }
 
     handleTopMoveEndCapture (e) {
         if (!this.monitor.isDragging() || this.monitor.didDrop()) {
-            this.moveStartSourceIds = null;
+            this.moveStartSourceIds = {};
             return;
         }
 
         e.preventDefault();
 
-        this._mouseClientOffset = {};
+        this._mouseClientOffset = null;
 
-        this.uninstallSourceNodeRemovalObserver();
         this.actions.drop();
         this.actions.endDrag();
-    }
-
-    installSourceNodeRemovalObserver (node) {
-        this.uninstallSourceNodeRemovalObserver();
-
-        this.draggedSourceNode = node;
-        this.draggedSourceNodeRemovalObserver = new window.MutationObserver(() => {
-            if (!node.parentElement) {
-                this.resurrectSourceNode();
-                this.uninstallSourceNodeRemovalObserver();
-            }
-        });
-
-        if (!node || !node.parentElement) {
-            return;
-        }
-
-        this.draggedSourceNodeRemovalObserver.observe(
-            node.parentElement,
-            { childList: true }
-        );
-    }
-
-    resurrectSourceNode () {
-        this.draggedSourceNode.style.display = 'none';
-        this.draggedSourceNode.removeAttribute('data-reactid');
-        document.body.appendChild(this.draggedSourceNode);
-    }
-
-    uninstallSourceNodeRemovalObserver () {
-        if (this.draggedSourceNodeRemovalObserver) {
-            this.draggedSourceNodeRemovalObserver.disconnect();
-        }
-
-        this.draggedSourceNodeRemovalObserver = null;
-        this.draggedSourceNode = null;
     }
 }
 
