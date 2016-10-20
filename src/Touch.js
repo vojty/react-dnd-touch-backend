@@ -219,6 +219,7 @@ export class TouchBackend {
             // to handle other browsers, we could just call window.getSelection().removeAllRanges();
             if (e.target.tagName !== 'SELECT' && e.target.tagName !== 'INPUT') {
                 e.preventDefault();
+                Array.from(document.getElementsByTagName('input')).forEach(element => { element.blur(); });
             }
         }
     }
