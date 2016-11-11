@@ -218,7 +218,7 @@ export class TouchBackend {
             // note: calling preventDefault here, seems to be the only way to defeat text selection in Safari
             // to handle other browsers, we could just call window.getSelection().removeAllRanges();
             if (e.target.tagName !== 'SELECT' && e.target.tagName !== 'INPUT') {
-                e.preventDefault();
+                // e.preventDefault();
                 Array.from(document.getElementsByTagName('input')).forEach(element => { element.blur(); });
             }
         }
